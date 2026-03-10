@@ -1,0 +1,7 @@
+project_id = "vmwauwtjsedwhjuhddxu"
+
+[functions.generate-dashboard]
+verify_jwt = false
+
+[functions.upload-csv]
+verify_jwt = false
