@@ -7,6 +7,59 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+// Always use a small local model server (e.g. Ollama) reachable from this function.
+// When running in Supabase's Docker network, use host.docker.internal to reach your Mac host.
+const LOCAL_MODEL_URL =
+  Deno.env.get("LOCAL_MODEL_URL") ?? "http://host.docker.internal:11434/api/chat";
+const LOCAL_MODEL_NAME = Deno.env.get("LOCAL_MODEL_NAME") ?? "llama3.2:3b";
+
+async function generateWithModel(params: {
+  systemPrompt: string;
+  messages: { role: "user" | "assistant"; content: string }[];
+  maxTokens: number;
+}): Promise<string> {
+  const { systemPrompt, messages, maxTokens } = params;
+
+  // Expect a local model server roughly following the Ollama /api/chat schema.
+  console.log("generateWithModel using local model", {
+    url: LOCAL_MODEL_URL,
+    model: LOCAL_MODEL_NAME,
+  });
+
+  const response = await fetch(LOCAL_MODEL_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: LOCAL_MODEL_NAME,
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...messages,
+      ],
+      stream: false,
+      options: {
+        num_predict: maxTokens,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error("Local model API error:", response.status, errText);
+    throw new Error(`Local model API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const text =
+    data.message?.content?.[0]?.text ??
+    data.message?.content ??
+    data.choices?.[0]?.message?.content ??
+    "";
+
+  return (typeof text === "string" ? text : "").trim();
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -21,9 +74,6 @@ serve(async (req) => {
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
-
-    const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-    if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured");
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -64,36 +114,12 @@ Rules:
       { role: "user" as const, content: prompt },
     ];
 
-    // Step 1: Generate SQL via Claude
-    const sqlResponse = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages,
-      }),
+    // Step 1: Generate SQL via model provider (Claude or local model)
+    let sqlQuery = await generateWithModel({
+      systemPrompt: SYSTEM_PROMPT,
+      messages,
+      maxTokens: 1024,
     });
-
-    if (!sqlResponse.ok) {
-      const errText = await sqlResponse.text();
-      console.error("Anthropic API error:", sqlResponse.status, errText);
-      if (sqlResponse.status === 429) {
-        return new Response(
-          JSON.stringify({ error: "Rate limit exceeded. Please try again in a moment." }),
-          { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      throw new Error(`Anthropic API error: ${sqlResponse.status}`);
-    }
-
-    const sqlData = await sqlResponse.json();
-    let sqlQuery = sqlData.content?.[0]?.text?.trim() || "";
     sqlQuery = sqlQuery.replace(/```sql\n?/gi, "").replace(/```\n?/g, "").trim().replace(/;\s*$/, "");
 
     if (sqlQuery === "UNABLE_TO_ANSWER" || !sqlQuery) {
@@ -134,7 +160,7 @@ Rules:
       );
     }
 
-    // Step 3: Determine chart type via Claude Haiku (fast + cheap)
+    // Step 3: Determine chart type via model provider
     const CHART_SYSTEM_PROMPT = `You are a chart type selector. Given a SQL query and its results, determine the best chart type. Respond with ONLY one of: bar, line, pie, funnel, multi_bar. No explanation.
 
 Rules:
@@ -144,17 +170,10 @@ Rules:
 - Funnel metrics (impressions → clicks → leads → conversions in sequence) → funnel
 - Multiple numeric metrics compared across categories → multi_bar`;
 
-    const chartResponse = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 10,
-        system: CHART_SYSTEM_PROMPT,
+    let chartType = "bar";
+    try {
+      const chartSuggestion = await generateWithModel({
+        systemPrompt: CHART_SYSTEM_PROMPT,
         messages: [
           {
             role: "user",
@@ -163,16 +182,14 @@ Rules:
             )}\n\nUser's original question: ${prompt}`,
           },
         ],
-      }),
-    });
-
-    let chartType = "bar";
-    if (chartResponse.ok) {
-      const chartData = await chartResponse.json();
-      const suggested = chartData.content?.[0]?.text?.trim().toLowerCase() || "";
+        maxTokens: 10,
+      });
+      const suggested = chartSuggestion.trim().toLowerCase();
       if (["bar", "line", "pie", "funnel", "multi_bar"].includes(suggested)) {
         chartType = suggested;
       }
+    } catch (e) {
+      console.error("Chart type model error:", e);
     }
 
     return new Response(

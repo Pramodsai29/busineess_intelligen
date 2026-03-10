@@ -71,7 +71,8 @@ BEGIN
     UPPER(TRIM(sql_text)) LIKE 'DROP TABLE%' OR
     UPPER(TRIM(sql_text)) LIKE 'ALTER TABLE%' OR
     UPPER(TRIM(sql_text)) LIKE 'CREATE POLICY%' OR
-    UPPER(TRIM(sql_text)) LIKE 'DO $$%' OR
+    -- Allow DO blocks without embedding the DO body marker directly
+    UPPER(TRIM(sql_text)) LIKE 'DO %' OR
     UPPER(TRIM(sql_text)) LIKE '%CREATE TABLE%' OR
     UPPER(TRIM(sql_text)) LIKE '%CREATE POLICY%'
   ) THEN
